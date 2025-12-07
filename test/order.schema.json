@@ -1,0 +1,19 @@
+{
+  "type": "record",
+  "name": "OrderEvent",
+  "namespace": "com.example",
+  "fields": [
+    {
+      "name": "orderId",
+      "type": "string"
+    },
+    {
+      "name": "amount",
+      "type": "double"
+    },
+    {
+      "name": "ts",
+      "type": "string"
+    }
+  ]
+}
