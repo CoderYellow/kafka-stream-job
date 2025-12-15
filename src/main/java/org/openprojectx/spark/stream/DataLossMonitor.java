@@ -1,8 +1,11 @@
 package org.openprojectx.spark.stream;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.kafka.clients.admin.*;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.spark.sql.streaming.StreamingQueryListener;
+import org.apache.spark.sql.streaming.SourceProgress;
 import org.apache.spark.sql.streaming.StreamingQueryProgress;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -15,6 +18,7 @@ public class DataLossMonitor extends StreamingQueryListener {
     private static final Logger log = LoggerFactory.getLogger(DataLossMonitor.class);
 
     private final AdminClient admin;
+    private final ObjectMapper mapper = new ObjectMapper();
 
     public DataLossMonitor(String bootstrapServers) {
         Properties props = new Properties();
@@ -23,127 +27,139 @@ public class DataLossMonitor extends StreamingQueryListener {
     }
 
     @Override
-    public void onQueryProgress(QueryProgressEvent event) {
-        StreamingQueryProgress progress = event.progress();
-
-        Arrays.stream(progress.sources()).forEach(source -> {
-            // Identify Kafka source
-            if (!source.description().contains("KafkaV2")) {
-                return;
-            }
-
-            String startOffsetJson = source.startOffset();
-            String endOffsetJson = source.endOffset();
-
-            Map<TopicPartition, Long> startOffsets = parseOffsetJson(startOffsetJson);
-            Map<TopicPartition, Long> endOffsets = parseOffsetJson(endOffsetJson);
-
-            detectDataLoss(startOffsets, endOffsets);
-        });
+    public void onQueryStarted(QueryStartedEvent event) {
+        log.info("Streaming query started: id={}, runId={}", event.id(), event.runId());
     }
 
     @Override
-    public void onQueryStarted(QueryStartedEvent event) {
-        log.info("Streaming query started. id=" + event.id());
+    public void onQueryProgress(QueryProgressEvent event) {
+        StreamingQueryProgress progress = event.progress();
+
+        for (SourceProgress source : progress.sources()) {
+            // We only care about Kafka sources
+            if (!source.description().contains("KafkaV2")) {
+                continue;
+            }
+
+            String startOffsetJson = source.startOffset();  // String JSON
+            String endOffsetJson = source.endOffset();    // String JSON
+
+            if (startOffsetJson == null || startOffsetJson.isEmpty()
+                    || "null".equals(startOffsetJson)) {
+                // First batch may have empty startOffset; skip
+                continue;
+            }
+
+            try {
+                Map<TopicPartition, Long> startOffsets = parseOffsets(startOffsetJson);
+                Map<TopicPartition, Long> endOffsets = parseOffsets(endOffsetJson);
+
+                detectDataLoss(startOffsets, endOffsets);
+            } catch (Exception e) {
+                log.error("Failed to parse Kafka offsets from progress: start={}, end={}",
+                        startOffsetJson, endOffsetJson, e);
+            }
+        }
     }
 
     @Override
     public void onQueryTerminated(QueryTerminatedEvent event) {
-        log.info("Streaming query terminated. id=" + event.id());
+        if (event.exception().isDefined()) {
+            log.error("Streaming query terminated with exception: id={}",
+                    event.id(), event.exception().get());
+        } else {
+            log.info("Streaming query terminated normally: id={}", event.id());
+        }
     }
 
-    private Map<TopicPartition, Long> parseOffsetJson(String json) {
-        /*
-         Example Spark JSON formats:
-
-         {"orders":{"0":100,"1":60,"2":66}}
-         {"topicA":{"0":130},"topicB":{"0":55}}
-        */
-
+    /**
+     * Parse Kafka offsets JSON produced by SourceProgress.startOffset/endOffset.
+     * Example: {"orders":{"0":100,"1":60,"2":66}}
+     */
+    private Map<TopicPartition, Long> parseOffsets(String json) throws Exception {
         Map<TopicPartition, Long> result = new HashMap<>();
+        if (json == null || json.isEmpty() || "null".equals(json)) {
+            return result;
+        }
 
-        if (json == null || json.isEmpty()) return result;
+        JsonNode root = mapper.readTree(json);
+        // root fields: topic -> { partition -> offset }
+        Iterator<Map.Entry<String, JsonNode>> topics = root.fields();
+        while (topics.hasNext()) {
+            Map.Entry<String, JsonNode> topicEntry = topics.next();
+            String topic = topicEntry.getKey();
+            JsonNode partitionsNode = topicEntry.getValue();
 
-        String cleaned = json.trim();
-
-        // Remove outer { }
-        if (cleaned.startsWith("{")) cleaned = cleaned.substring(1);
-        if (cleaned.endsWith("}")) cleaned = cleaned.substring(0, cleaned.length()-1);
-
-        // Split per-topic-section: e.g. orders:{0:100,1:60}
-        for (String topicSection : cleaned.split("},")) {
-            topicSection = topicSection.replace("}", "");
-
-            String[] parts = topicSection.split(":\\{");
-            if (parts.length != 2) continue;
-
-            String topic = parts[0].replace("\"", "").trim();
-            String offsetList = parts[1];
-
-            for (String kv : offsetList.split(",")) {
-                String[] arr = kv.split(":");
-                if (arr.length != 2) continue;
-
-                int partition = Integer.parseInt(arr[0].replace("\"", "").trim());
-                long offset = Long.parseLong(arr[1].trim());
-
+            Iterator<Map.Entry<String, JsonNode>> parts = partitionsNode.fields();
+            while (parts.hasNext()) {
+                Map.Entry<String, JsonNode> p = parts.next();
+                int partition = Integer.parseInt(p.getKey());
+                long offset = p.getValue().asLong();
                 result.put(new TopicPartition(topic, partition), offset);
             }
         }
-
         return result;
     }
 
-    private void detectDataLoss(Map<TopicPartition, Long> startOffsets,
-                                Map<TopicPartition, Long> endOffsets) {
+    /**
+     * Detects data loss by comparing Spark's expected offsets with Kafka's earliest offsets.
+     */
+    private void detectDataLoss(Map<TopicPartition, Long> start, Map<TopicPartition, Long> end) {
+        for (TopicPartition tp : start.keySet()) {
+            long expectedStart = start.get(tp);
+            long expectedEnd = end.getOrDefault(tp, expectedStart);
 
-        for (TopicPartition tp : startOffsets.keySet()) {
-            long expectedStart = startOffsets.get(tp);
+            long earliest = getEarliestOffset(tp);
+            long latest = getLatestOffset(tp);
 
-            long earliestAvailable = earliestOffset(tp);
-            long latestAvailable = latestOffset(tp);
-
-            if (earliestAvailable > expectedStart) {
-                long lostBegin = expectedStart;
-                long lostEnd = earliestAvailable - 1;
-                long lostCount = earliestAvailable - expectedStart;
-
-                log.error(
-                        "DATA LOSS DETECTED for {} partition {}. " +
-                                "Expected to read from offset >= {}, but earliest available is {}. " +
-                                "Lost range: {} → {} ({} messages)",
-                        tp.topic(), tp.partition(),
-                        expectedStart, earliestAvailable,
-                        lostBegin, lostEnd, lostCount
-                );
+            if (earliest == -1L) {
+                // Could not fetch offsets; log and continue
+                log.warn("Could not fetch earliest offset for {}", tp);
+                continue;
             }
 
-            log.debug(
-                    "Partition {} earliest={}, latest={}",
-                    tp, earliestAvailable, latestAvailable
-            );
+            // Data loss if Kafka earliest offset is greater than what Spark thinks
+            if (earliest > expectedStart) {
+                long lostFrom = expectedStart;
+                long lostTo = earliest - 1;
+                long lostCount = earliest - expectedStart;
+
+                log.error(
+                        "DATA LOSS DETECTED for {}: expected to read from offset {} "
+                                + "but earliest available is {}. Lost range: {} → {} ({} messages). "
+                                + "Expected batch range (Spark view): {} → {}",
+                        tp, expectedStart, earliest,
+                        lostFrom, lostTo, lostCount,
+                        expectedStart, expectedEnd
+                );
+
+                // TODO: here you can emit metrics, push to Prometheus, send alert, etc.
+            } else {
+                log.debug("No data loss for {}. expectedStart={}, earliest={}, latest={}",
+                        tp, expectedStart, earliest, latest);
+            }
         }
     }
 
-    private long earliestOffset(TopicPartition tp) {
+    private long getEarliestOffset(TopicPartition tp) {
         try {
-            ListOffsetsResult result =
-                    admin.listOffsets(Collections.singletonMap(tp, OffsetSpec.earliest()));
+            ListOffsetsResult result = admin.listOffsets(
+                    Collections.singletonMap(tp, OffsetSpec.earliest()));
             return result.partitionResult(tp).get().offset();
         } catch (InterruptedException | ExecutionException e) {
             log.error("Error fetching earliest offset for " + tp, e);
-            return -1;
+            return -1L;
         }
     }
 
-    private long latestOffset(TopicPartition tp) {
+    private long getLatestOffset(TopicPartition tp) {
         try {
-            ListOffsetsResult result =
-                    admin.listOffsets(Collections.singletonMap(tp, OffsetSpec.latest()));
+            ListOffsetsResult result = admin.listOffsets(
+                    Collections.singletonMap(tp, OffsetSpec.latest()));
             return result.partitionResult(tp).get().offset();
         } catch (Exception e) {
             log.error("Error fetching latest offset for " + tp, e);
-            return -1;
+            return -1L;
         }
     }
 }

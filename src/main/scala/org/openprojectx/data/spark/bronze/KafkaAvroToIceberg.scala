@@ -4,11 +4,20 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.avro.functions.from_avro
 import org.openprojectx.data.spark.bronze.SparkConfigLoader.loadFromResources
-import org.openprojectx.spark.stream.DataLossMonitor
+import org.openprojectx.spark.stream.{CheckpointKafkaDataLossMonitor, DataLossMonitor, KafkaStreamingPreflightDetector}
 
 object KafkaAvroToIceberg {
 
   def main(args: Array[String]): Unit = {
+    val checkpointDir = "/data/Git/kafka-stream-job/test/warehouse/ckpt/orders_stream/"
+    val bootstrapServers = "192.168.0.131:9092,192.168.0.132:9092,192.168.0.133:9092"
+
+    new CheckpointKafkaDataLossMonitor(checkpointDir, bootstrapServers).checkLatestBatch()
+
+
+    // Option A: Pre-flight guard
+    new KafkaStreamingPreflightDetector(checkpointDir, bootstrapServers)
+      .detect()
 
     //    order-bronze-job
     val conf = loadFromResources()
@@ -45,7 +54,7 @@ object KafkaAvroToIceberg {
     // 2. Stream from Kafka
     val raw = spark.readStream
       .format("kafka")
-      .option("kafka.bootstrap.servers", "192.168.0.129:9092")
+      .option("kafka.bootstrap.servers",bootstrapServers)
       .option("subscribe", "orders")
       .option("startingOffsets", "earliest")
       .option("failOnDataLoss", "false")
@@ -64,16 +73,27 @@ object KafkaAvroToIceberg {
 
 
     spark.streams.addListener(
-      new DataLossMonitor("192.168.0.129:9092")
+      new DataLossMonitor(" 192.168.0.131:9092,192.168.0.132:9092,192.168.0.133:9092")
     )
 
+    spark.sql(
+      """
+      CREATE TABLE IF NOT EXISTS bronze.db.orders (
+        orderId STRING,
+        amount DOUBLE,
+        ts STRING,
+        ingested_at TIMESTAMP,
+        source STRING
+      )
+      USING iceberg
+  """);
 
     // 4. Write to Iceberg table
     val query = decoded.writeStream
       .format("iceberg")
       //      .option("path", "bronze.db.orders")      // catalog.db.table
       //      .option("checkpointLocation", "s3://data/ckpt/orders_stream/")
-      .option("checkpointLocation", "file:///data/Git/kafka-stream-job/test/warehouse/ckpt/orders_stream/")
+      .option("checkpointLocation", s"file://$checkpointDir")
       .outputMode("append")
       //      .start()
       //      .toTable("bronze.db.orders")
@@ -86,7 +106,7 @@ object KafkaAvroToIceberg {
 
     // Print progress
     println("---- PROGRESS ----")
-    println("progress: "+query.lastProgress.prettyJson)
+    println("progress: " + query.lastProgress.prettyJson)
 
     // Explain plan
     println("---- PLAN ----")

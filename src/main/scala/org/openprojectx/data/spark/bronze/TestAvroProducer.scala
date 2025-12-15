@@ -34,7 +34,7 @@ object TestAvroProducer {
     val schema = new Schema.Parser().parse(schemaJson)
 
     val props = new Properties()
-    props.put("bootstrap.servers", "192.168.0.129:9092")
+    props.put("bootstrap.servers", " 192.168.0.131:9092,192.168.0.132:9092,192.168.0.133:9092")
     props.put("key.serializer", classOf[ByteArraySerializer].getName)
     props.put("value.serializer", classOf[ByteArraySerializer].getName)
     props.put("acks", "all")
@@ -45,7 +45,7 @@ object TestAvroProducer {
 
     println("Producing 20 Avro messages to Kafka topic 'orders'...")
 
-    (1 to 20).foreach { _ =>
+    (1 to 256).foreach { _ =>
 
       // Build Avro record
       val record: GenericRecord = new GenericData.Record(schema)

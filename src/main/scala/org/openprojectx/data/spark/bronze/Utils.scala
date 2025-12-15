@@ -33,7 +33,7 @@ object Utils {
 
    def checkDataLoss(): Unit = {
     val topic = "orders"
-    val brokers = "192.168.0.129:9092"
+    val brokers = " 192.168.0.131:9092,192.168.0.132:9092,192.168.0.133:9092"
     val checkpointOffsetsDir = "/data/Git/kafka-stream-job/test/warehouse/ckpt/orders_stream/offsets"
     val lossLogFile = "/data/Git/kafka-stream-job/test/data/loss-log.txt"
 

@@ -1,5 +1,4 @@
 plugins {
-    java
     scala
     `maven-publish`
     id("com.github.johnrengelman.shadow") version "8.1.1"
@@ -12,6 +11,42 @@ version = "0.1.0-SNAPSHOT"
 val scalaVersion = "2.13"
 val scalaVersionFull = "2.13.8"
 val sparkVersion = "3.5.5"
+
+//tasks.withType<JavaCompile>().configureEach {
+//    dependsOn(tasks.withType<ScalaCompile>())
+//}
+//
+//
+//tasks.named<ScalaCompile>("compileScala") {
+//    scalaCompileOptions.additionalParameters = listOf("-Ybackend-parallelism", "8")
+//}
+
+//tasks.withType<ScalaCompile>().configureEach {
+//    source = sourceSets["main"].allSource
+//}
+//
+//tasks.named<JavaCompile>("compileJava") {
+//    enabled = false
+//}
+
+sourceSets {
+    main {
+//        withConvention(org.gradle.api.tasks.scala.ScalaSourceSet::class) {
+//            scala.setSrcDirs(listOf("src/main/scala", "src/main/java")) // Include Java sources in Scala source set
+//        }
+        scala {
+            setSrcDirs(listOf("src/main/scala" ,"src/main/java"))
+        }
+
+        java.setSrcDirs(emptyList<String>()) // Exclude Java sources from Java source set
+    }
+//    test {
+//        withConvention(org.gradle.api.tasks.scala.ScalaSourceSet::class) {
+//            scala.setSrcDirs(listOf("src/test/scala", "src/test/java"))
+//        }
+//        java.setSrcDirs(emptyList<String>())
+//    }
+}
 
 repositories {
 //    jcenter()
